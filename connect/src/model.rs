@@ -254,7 +254,13 @@ mod tests {
 
     #[test]
     fn no_context_uri_plays_the_tracks() {
-        for uri in [None, Some(""), Some("-")] {
+        for uri in [
+            None,
+            Some(""),
+            Some("-"),
+            Some("spotify:web-api"),
+            Some("spotify:unknown"),
+        ] {
             let c = play_context(uri, &TRACKS);
             assert!(
                 matches!(c, Ok(PlayContext::Tracks(t)) if t == TRACKS),
