@@ -1627,9 +1627,10 @@ impl Future for PlayerInternal {
                 return Poll::Pending;
             }
 
-            // `mpsc::poll_recv` returns `Pending` once Tokio's cooperative budget
-            // is spent, even with commands queued. Yield as well; continuing to
-            // decode would hold back seeks and pauses until the end of the track.
+            // Tokio's cooperative budget resets only when this future returns. Once
+            // it is spent, the command channel and the preload return `Pending` even
+            // when ready, so yield as well: decoding on would hold back commands and
+            // preloading until the end of the track.
             ready!(coop::poll_proceed(cx)).made_progress();
         }
     }
