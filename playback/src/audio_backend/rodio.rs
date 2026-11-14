@@ -73,7 +73,7 @@ impl From<cpal::SupportedStreamConfigsError> for RodioError {
 
 pub struct RodioSink {
     rodio_sink: rodio::Sink,
-    _stream: rodio::OutputStream,
+    stream: rodio::OutputStream,
 }
 
 fn list_formats(device: &cpal::Device) {
@@ -224,7 +224,7 @@ pub fn open(host: cpal::Host, device: Option<String>, format: AudioFormat) -> Ro
     debug!("Rodio sink was created");
     RodioSink {
         rodio_sink: sink,
-        _stream: stream,
+        stream,
     }
 }
 
@@ -241,12 +241,9 @@ impl Sink for RodioSink {
     }
 
     fn clear(&mut self) -> SinkResult<()> {
-        // Rodio's `clear` drops the queued audio but also pauses; keep playing if we were.
-        let paused = self.rodio_sink.is_paused();
-        self.rodio_sink.clear();
-        if !paused {
-            self.rodio_sink.play();
-        }
+        // Dropping a rodio sink stops the audio it queued. Rodio's own `clear` would
+        // wait for its audio thread and pause, and it miscounts `len()` in some versions.
+        self.rodio_sink = rodio::Sink::connect_new(self.stream.mixer());
         Ok(())
     }
 
