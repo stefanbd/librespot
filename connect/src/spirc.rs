@@ -291,9 +291,10 @@ impl Spirc {
         Ok(self.commands.send(SpircCommand::Shutdown)?)
     }
 
-    /// Resumes the playback
+    /// Resumes the playback, or starts the current track again if playback has
+    /// stopped, as at the end of the queue
     ///
-    /// Does nothing if we are not the active device, or it isn't paused.
+    /// Does nothing if we are not the active device, or it is already playing.
     pub fn play(&self) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::Play)?)
     }
@@ -750,8 +751,8 @@ impl SpircTask {
                 }
                 return self.handle_disconnect().await;
             }
-            SpircCommand::Play => self.handle_play(),
-            SpircCommand::PlayPause => self.handle_play_pause(),
+            SpircCommand::Play => self.handle_play()?,
+            SpircCommand::PlayPause => self.handle_play_pause()?,
             SpircCommand::Pause => self.handle_pause(),
             SpircCommand::Prev => self.handle_prev()?,
             SpircCommand::Next => self.handle_next(None)?,
@@ -895,13 +896,8 @@ impl SpircTask {
             }
             PlayerEvent::Unavailable { track_id, .. } => {
                 self.handle_unavailable(&track_id)?;
-                // At the end of the queue, stop instead of rewinding (see `handle_next`):
-                // if every track fails to load, rewinding would load them again and again.
-                if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri()
-                    && !self.load_next_track(None)?
-                {
-                    info!("Not playing next track because there are no more tracks left in queue.");
-                    self.handle_stop()
+                if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri() {
+                    self.handle_next(None)?
                 }
             }
             _ => return Ok(()),
@@ -1180,10 +1176,7 @@ impl SpircTask {
             }
             SkipNext(skip_next) => self.handle_next(skip_next.track.map(|t| t.uri))?,
             SkipPrev(_) => self.handle_prev()?,
-            Resume(_) if matches!(self.play_status, SpircPlayStatus::Stopped) => {
-                self.load_track(true, 0)?
-            }
-            Resume(_) => self.handle_play(),
+            Resume(_) => self.handle_play()?,
         }
 
         self.update_state = true;
@@ -1330,17 +1323,12 @@ impl SpircTask {
 
     fn handle_stop(&mut self) {
         self.player.stop();
-
-        if let Err(why) = self.rewind() {
-            warn!("failed filling up next_track during stopping: {why}")
-        }
-    }
-
-    /// Resets playback to the start of the context, without touching the player
-    fn rewind(&mut self) -> Result<(), Error> {
         self.connect_state.update_position(0, self.now_ms());
         self.connect_state.clear_next_tracks();
-        self.connect_state.reset_playback_to_position(None)
+
+        if let Err(why) = self.connect_state.reset_playback_to_position(None) {
+            warn!("failed filling up next_track during stopping: {why}")
+        }
     }
 
     fn handle_activate(&mut self) {
@@ -1543,8 +1531,10 @@ impl SpircTask {
         Ok(())
     }
 
-    fn handle_play(&mut self) {
+    fn handle_play(&mut self) -> Result<(), Error> {
         match self.play_status {
+            // the player holds nothing to resume, so start the current track again
+            SpircPlayStatus::Stopped => return self.load_track(true, 0),
             SpircPlayStatus::Paused {
                 position_ms,
                 preloading_of_next_track_triggered,
@@ -1561,24 +1551,23 @@ impl SpircTask {
                 self.player.play();
                 self.play_status = SpircPlayStatus::LoadingPlay { position_ms };
             }
-            _ => return,
+            _ => return Ok(()),
         }
 
         // Synchronize the volume from the mixer. This is useful on
         // systems that can switch sources from and back to librespot.
         let current_volume = self.mixer.volume();
         self.set_volume(current_volume);
+        Ok(())
     }
 
-    fn handle_play_pause(&mut self) {
+    fn handle_play_pause(&mut self) -> Result<(), Error> {
         match self.play_status {
-            SpircPlayStatus::Paused { .. } | SpircPlayStatus::LoadingPause { .. } => {
-                self.handle_play()
-            }
             SpircPlayStatus::Playing { .. } | SpircPlayStatus::LoadingPlay { .. } => {
-                self.handle_pause()
+                self.handle_pause();
+                Ok(())
             }
-            _ => (),
+            _ => self.handle_play(),
         }
     }
 
@@ -1748,27 +1737,6 @@ impl SpircTask {
     }
 
     fn handle_next(&mut self, track_uri: Option<String>) -> Result<(), Error> {
-        if self.load_next_track(track_uri)? {
-            return Ok(());
-        }
-
-        // Rewind to the first track and load it paused, as Spotify's own clients do.
-        // Stopping would unload the player, and while stopped, `Spirc::play` and
-        // `Spirc::play_pause` (an application's own controls, such as media keys) do
-        // nothing, unlike a Connect client's resume.
-        info!("No more tracks left in queue, rewinding to the first track");
-        match self.rewind() {
-            Ok(()) => self.load_track(false, 0),
-            Err(why) => {
-                warn!("failed rewinding at the end of the queue: {why}");
-                self.player.stop();
-                Ok(())
-            }
-        }
-    }
-
-    /// Loads the next track, or `track_uri`, and returns `false` if the queue has none left
-    fn load_next_track(&mut self, track_uri: Option<String>) -> Result<bool, Error> {
         let continue_playing = self.connect_state.is_playing();
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
@@ -1790,10 +1758,12 @@ impl SpircTask {
 
         if has_next_track {
             self.add_autoplay_resolving_when_required();
-            self.load_track(continue_playing, 0)?;
+            self.load_track(continue_playing, 0)
+        } else {
+            info!("Not playing next track because there are no more tracks left in queue.");
+            self.handle_stop();
+            Ok(())
         }
-
-        Ok(has_next_track)
     }
 
     fn handle_prev(&mut self) -> Result<(), Error> {
@@ -2027,8 +1997,8 @@ mod tests {
         }
     }
 
-    /// An active device playing the last track of a three-track context.
-    fn task_at_last_track() -> SpircTask {
+    /// A Spirc task with a real player, which needs no connection to Spotify.
+    fn task() -> SpircTask {
         let session = Session::new(Default::default(), None);
         let mixer: Arc<dyn Mixer> = Arc::new(TestMixer);
         let player = Player::new(
@@ -2037,16 +2007,13 @@ mod tests {
             mixer.get_soft_volume(),
             || Box::new(TestSink),
         );
-        let mut task = SpircTask {
+        SpircTask {
             player,
             mixer,
             connect_state: ConnectState::new(ConnectConfig::default(), &session),
             connect_established: true,
             play_request_id: None,
-            play_status: SpircPlayStatus::Playing {
-                nominal_start_time: 0,
-                preloading_of_next_track_triggered: false,
-            },
+            play_status: SpircPlayStatus::Stopped,
             connection_id_update: futures_util::stream::pending().boxed(),
             connect_state_update: futures_util::stream::pending().boxed(),
             connect_state_volume_update: futures_util::stream::pending().boxed(),
@@ -2066,47 +2033,38 @@ mod tests {
             update_volume: false,
             update_state: false,
             spirc_id: 0,
-        };
+        }
+    }
+
+    /// An active device whose playback stopped when the last of three tracks ended.
+    fn task_stopped_at_the_end_of_the_queue() -> SpircTask {
+        let mut task = task();
         task.connect_state.set_active(true);
         task.load_context_from_tracks(TRACKS.map(String::from).to_vec())
             .unwrap();
         task.connect_state
             .reset_playback_to_position(Some(TRACKS.len() - 1))
             .unwrap();
+        task.handle_next(None).unwrap();
         task
     }
 
     #[tokio::test]
-    async fn end_of_queue_rewinds_to_the_first_track_paused() {
-        let mut task = task_at_last_track();
-
-        task.handle_next(None).unwrap();
-
+    async fn play_starts_the_queue_again_once_it_has_ended() {
+        let mut task = task_stopped_at_the_end_of_the_queue();
+        task.handle_play().unwrap();
         assert_eq!(task.connect_state.current_track(|t| &t.uri), TRACKS[0]);
         assert!(matches!(
             task.play_status,
-            SpircPlayStatus::LoadingPause { position_ms: 0 }
+            SpircPlayStatus::LoadingPlay { position_ms: 0 }
         ));
-    }
 
-    #[tokio::test]
-    async fn end_of_unplayable_queue_stops_after_one_pass() {
-        let mut task = task_at_last_track();
-        let mut player_events = task.player.get_player_event_channel();
-        // the last track ends, and then every track fails to load
-        task.handle_next(None).unwrap();
-
-        let mut loads = 0;
-        while !matches!(task.play_status, SpircPlayStatus::Stopped) {
-            let event = tokio::time::timeout(Duration::from_secs(5), player_events.recv())
-                .await
-                .expect("the player went quiet before playback stopped")
-                .unwrap();
-            if let PlayerEvent::Loading { .. } = event {
-                loads += 1;
-                assert!(loads <= TRACKS.len(), "loads the unplayable queue again");
-            }
-            task.handle_player_event(event).unwrap();
-        }
+        let mut task = task_stopped_at_the_end_of_the_queue();
+        task.handle_play_pause().unwrap();
+        assert_eq!(task.connect_state.current_track(|t| &t.uri), TRACKS[0]);
+        assert!(matches!(
+            task.play_status,
+            SpircPlayStatus::LoadingPlay { position_ms: 0 }
+        ));
     }
 }
