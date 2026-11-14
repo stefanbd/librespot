@@ -1677,6 +1677,13 @@ impl PlayerInternal {
         }
     }
 
+    /// Sends `event`, then stops the sink, so that a sink that blocks in `stop` until
+    /// it has played out its buffer does not delay the event.
+    fn send_event_and_stop_sink(&mut self, event: PlayerEvent) {
+        self.send_event(event);
+        self.ensure_sink_stopped(false);
+    }
+
     fn handle_player_stop(&mut self) {
         match self.state {
             PlayerState::Playing {
@@ -1701,12 +1708,11 @@ impl PlayerInternal {
             } => {
                 let track_id = track_id.clone();
 
-                self.ensure_sink_stopped(false);
-                self.send_event(PlayerEvent::Stopped {
+                self.state = PlayerState::Stopped;
+                self.send_event_and_stop_sink(PlayerEvent::Stopped {
                     track_id,
                     play_request_id,
                 });
-                self.state = PlayerState::Stopped;
             }
             PlayerState::Stopped => (),
             PlayerState::Invalid => {
@@ -1757,15 +1763,11 @@ impl PlayerInternal {
 
                 self.state.playing_to_paused();
 
-                // Report the pause before stopping the sink, as `handle_play`
-                // reports playing before starting it: a sink that takes time to
-                // stop must not delay the event.
-                self.send_event(PlayerEvent::Paused {
+                self.send_event_and_stop_sink(PlayerEvent::Paused {
                     track_id,
                     play_request_id,
                     position_ms: stream_position_ms,
                 });
-                self.ensure_sink_stopped(false);
             }
             PlayerState::Loading {
                 ref mut start_playback,
@@ -1954,8 +1956,6 @@ impl PlayerInternal {
                 is_explicit: loaded_track.is_explicit,
             };
         } else {
-            self.ensure_sink_stopped(false);
-
             self.state = PlayerState::Paused {
                 track_id: track_id.clone(),
                 play_request_id,
@@ -1971,7 +1971,7 @@ impl PlayerInternal {
                 is_explicit: loaded_track.is_explicit,
             };
 
-            self.send_event(PlayerEvent::Paused {
+            self.send_event_and_stop_sink(PlayerEvent::Paused {
                 track_id,
                 play_request_id,
                 position_ms,
@@ -2716,8 +2716,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
-
     use crate::{
         audio_backend::SinkResult,
         decoder::{DecoderError, DecoderResult},
@@ -2829,19 +2827,19 @@ mod tests {
         }
     }
 
-    /// Records whether the player reported Paused before stopping the sink.
+    /// Records the events the player had sent when it stopped the sink.
     struct StopProbe {
         events: mpsc::UnboundedReceiver<PlayerEvent>,
-        paused_before_stop: Arc<AtomicBool>,
+        sent_before_stop: Arc<Mutex<Option<Vec<PlayerEvent>>>>,
     }
 
     impl Sink for StopProbe {
         fn stop(&mut self) -> SinkResult<()> {
+            let mut sent = vec![];
             while let Ok(event) = self.events.try_recv() {
-                if matches!(event, PlayerEvent::Paused { .. }) {
-                    self.paused_before_stop.store(true, Ordering::Relaxed);
-                }
+                sent.push(event);
             }
+            *self.sent_before_stop.lock().unwrap() = Some(sent);
             Ok(())
         }
 
@@ -2850,8 +2848,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn pause_is_reported_before_the_sink_stops() {
+    /// Returns the events a playing player had sent when `act` made it stop the sink.
+    fn sent_before_sink_stop(act: impl FnOnce(&mut PlayerInternal)) -> Vec<PlayerEvent> {
         let (_commands, rx) = mpsc::unbounded_channel();
         let mut player = playing_player(
             rx,
@@ -2862,15 +2860,57 @@ mod tests {
         );
         let (events_tx, events) = mpsc::unbounded_channel();
         player.event_senders.push(events_tx);
-        let paused_before_stop = Arc::new(AtomicBool::new(false));
+        let sent_before_stop = Arc::new(Mutex::new(None));
         player.sink = Box::new(StopProbe {
             events,
-            paused_before_stop: paused_before_stop.clone(),
+            sent_before_stop: sent_before_stop.clone(),
         });
-        player.handle_pause();
+        act(&mut player);
+        sent_before_stop
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the sink was not stopped")
+    }
+
+    #[tokio::test]
+    async fn pause_is_reported_before_the_sink_stops() {
+        let sent = sent_before_sink_stop(PlayerInternal::handle_pause);
         assert!(
-            paused_before_stop.load(Ordering::Relaxed),
+            sent.iter()
+                .any(|event| matches!(event, PlayerEvent::Paused { .. })),
             "a sink that is slow to stop must not delay the Paused event"
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_load_is_reported_before_the_sink_stops() {
+        let sent = sent_before_sink_stop(|player| {
+            // Loading the playing track reuses its decoder, so the load completes at once.
+            let PlayerState::Playing { track_id, .. } = &player.state else {
+                unreachable!()
+            };
+            let load = PlayerCommand::Load {
+                track_id: track_id.clone(),
+                play: false,
+                position_ms: 0,
+            };
+            player.handle_command(load).unwrap();
+        });
+        assert!(
+            sent.iter()
+                .any(|event| matches!(event, PlayerEvent::Paused { .. })),
+            "a sink that is slow to stop must not delay the Paused event"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_is_reported_before_the_sink_stops() {
+        let sent = sent_before_sink_stop(PlayerInternal::handle_player_stop);
+        assert!(
+            sent.iter()
+                .any(|event| matches!(event, PlayerEvent::Stopped { .. })),
+            "a sink that is slow to stop must not delay the Stopped event"
         );
     }
 }
