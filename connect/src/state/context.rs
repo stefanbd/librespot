@@ -22,7 +22,7 @@ const LOCAL_FILES_IDENTIFIER: &str = "spotify:local-files";
 const SEARCH_IDENTIFIER: &str = "spotify:search";
 /// The context of tracks played by their uris, as the Web API plays them;
 /// spotify uses it too, and it cannot be resolved.
-pub(crate) const WEB_API_IDENTIFIER: &str = "spotify:webapi";
+pub(super) const WEB_API_IDENTIFIER: &str = "spotify:webapi";
 
 #[derive(Debug)]
 pub struct StateContext {
@@ -140,8 +140,15 @@ impl ConnectState {
         self.update_restrictions()
     }
 
+    /// Whether `uri` stands for no context, which leaves the tracks to come with it.
+    /// A Web API play of `uris` comes under `spotify:webapi`, and transfers have
+    /// also come with `-` or an empty uri.
+    pub fn is_placeholder_uri(uri: &str) -> bool {
+        uri.is_empty() || uri == "-" || uri == WEB_API_IDENTIFIER
+    }
+
     pub fn valid_resolve_uri(uri: &str) -> Option<&str> {
-        if uri.is_empty() || uri == WEB_API_IDENTIFIER || uri.starts_with(SEARCH_IDENTIFIER) {
+        if Self::is_placeholder_uri(uri) || uri.starts_with(SEARCH_IDENTIFIER) {
             None
         } else {
             Some(uri)
@@ -298,6 +305,22 @@ impl ConnectState {
             .collect();
 
         Ok(Some(next_contexts))
+    }
+
+    pub fn update_context_from_tracks(
+        &mut self,
+        tracks: impl Into<ContextPage>,
+    ) -> Result<(), Error> {
+        let context = Context {
+            // by providing values for uri/url the player in the official client's isn't frozen
+            uri: Some(WEB_API_IDENTIFIER.into()),
+            url: Some(format!("context://{WEB_API_IDENTIFIER}")),
+            pages: vec![tracks.into()],
+            ..Default::default()
+        };
+
+        self.update_context(context, ContextType::Default)
+            .map(|_| ())
     }
 
     fn find_first_prev_track_index(&self, ctx: &StateContext) -> Option<usize> {

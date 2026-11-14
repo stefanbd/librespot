@@ -27,7 +27,7 @@ use crate::{
         user_attributes::UserAttributesMutation,
     },
     state::{
-        context::{ContextType, ResetContext, WEB_API_IDENTIFIER},
+        context::{ContextType, ResetContext},
         provider::IsProvider,
         {ConnectConfig, ConnectState},
     },
@@ -1178,7 +1178,7 @@ impl SpircTask {
         let mut ctx_uri = match transfer.current_session.context.uri {
             None => Err(SpircError::NoUri("transfer context"))?,
             // can apparently happen when a state is transferred and was started with "uris" via the api
-            Some(ref uri) if uri == "-" || uri.is_empty() => None,
+            Some(ref uri) if ConnectState::is_placeholder_uri(uri) => None,
             Some(ref uri) => Some(uri.clone()),
         };
 
@@ -1284,11 +1284,12 @@ impl SpircTask {
                     warn!("continuing transfer in an unknown state. {why}");
                     self.transfer_state = Some(transfer);
                 }
-                Ok(ctx) => {
-                    let idx = ConnectState::find_index_in_context(ctx, |pt| {
-                        self.connect_state.current_track(|t| pt.uri == t.uri)
-                    })?;
-                    self.connect_state.reset_playback_to_position(Some(idx))?;
+                // the transfer brought its tracks, so it's finished as a resolved one is
+                Ok(_) => {
+                    if let Err(why) = self.connect_state.finish_transfer(transfer) {
+                        error!("setup of state failed: {why}")
+                    }
+                    self.add_autoplay_resolving_when_required()
                 }
             }
         }
@@ -1504,18 +1505,7 @@ impl SpircTask {
     }
 
     fn load_context_from_tracks(&mut self, tracks: impl Into<ContextPage>) -> Result<(), Error> {
-        let ctx = Context {
-            // by providing values for uri/url the player in the official client's isn't frozen
-            uri: Some(WEB_API_IDENTIFIER.into()),
-            url: Some(format!("context://{WEB_API_IDENTIFIER}")),
-            pages: vec![tracks.into()],
-            ..Default::default()
-        };
-
-        let _ = self
-            .connect_state
-            .update_context(ctx, ContextType::Default)?;
-
+        self.connect_state.update_context_from_tracks(tracks)?;
         self.emit_set_queue_event();
 
         Ok(())

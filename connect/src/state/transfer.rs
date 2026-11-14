@@ -2,7 +2,7 @@ use crate::{
     core::Error,
     protocol::{player::ProvidedTrack, transfer_state::TransferState},
     state::{
-        context::ContextType,
+        context::{ContextType, WEB_API_IDENTIFIER},
         metadata::Metadata,
         options::ShuffleState,
         provider::{IsProvider, Provider},
@@ -90,10 +90,10 @@ impl ConnectState {
             }
         }
 
-        const UNKNOWN_URI: &str = "spotify:unknown";
         // it's important to always set the url/uri to a value
-        // so that the player doesn't go into an inactive state
-        let uri = ctx_uri.unwrap_or(UNKNOWN_URI.into());
+        // so that the player doesn't go into an inactive state;
+        // without a context uri, the transfer's tracks play as those played by their uris
+        let uri = ctx_uri.unwrap_or(WEB_API_IDENTIFIER.into());
 
         player.context_url = format!("context://{uri}");
         player.context_uri = uri;

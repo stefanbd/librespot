@@ -1,7 +1,7 @@
 use crate::{
     core::dealer::protocol::SkipTo,
     protocol::{context::Context, context_player_options::ContextPlayerOptionOverrides},
-    state::context::WEB_API_IDENTIFIER,
+    state::ConnectState,
 };
 
 use std::ops::Deref;
@@ -31,12 +31,11 @@ impl TryFrom<&Context> for PlayContext {
     type Error = ();
 
     fn try_from(context: &Context) -> Result<Self, Self::Error> {
-        // a Web API play of `uris` carries its tracks inline, under an empty
-        // uri or `spotify:webapi`, neither of which can be resolved
+        // without a context uri, the tracks come inline, as for a Web API play of `uris`
         match context
             .uri
             .as_deref()
-            .filter(|uri| !uri.is_empty() && *uri != WEB_API_IDENTIFIER)
+            .filter(|uri| !ConnectState::is_placeholder_uri(uri))
         {
             Some(uri) => Ok(PlayContext::Uri(uri.to_string())),
             None if !context.pages.is_empty() => Ok(PlayContext::Tracks(
@@ -254,9 +253,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_context_uri_plays_the_tracks() {
-        let c = play_context(Some(""), &TRACKS);
-        assert!(matches!(c, Ok(PlayContext::Tracks(t)) if t == TRACKS));
+    fn no_context_uri_plays_the_tracks() {
+        for uri in [None, Some(""), Some("-")] {
+            let c = play_context(uri, &TRACKS);
+            assert!(
+                matches!(c, Ok(PlayContext::Tracks(t)) if t == TRACKS),
+                "{uri:?}"
+            );
+        }
     }
 
     #[test]
@@ -266,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn no_uri_and_no_pages_is_an_error() {
+    fn web_api_play_without_pages_is_an_error() {
         let context = Context {
             uri: Some("spotify:webapi".to_string()),
             ..Default::default()
