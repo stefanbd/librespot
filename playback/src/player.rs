@@ -1677,6 +1677,15 @@ impl PlayerInternal {
         }
     }
 
+    /// Drops the audio a running sink still holds from before a seek.
+    fn clear_sink(&mut self) {
+        if self.sink_status == SinkStatus::Running {
+            if let Err(e) = self.sink.clear() {
+                error!("{e}");
+            }
+        }
+    }
+
     fn handle_player_stop(&mut self) {
         match self.state {
             PlayerState::Playing {
@@ -2055,6 +2064,7 @@ impl PlayerInternal {
                 if position_ms != *stream_position_ms {
                     // This may be blocking.
                     *stream_position_ms = decoder.seek(position_ms)?;
+                    self.clear_sink();
                 }
 
                 // Move the info from the current state into a PlayerLoadedTrackData so we can use
@@ -2259,12 +2269,9 @@ impl PlayerInternal {
         }
 
         if let Some(decoder) = self.state.decoder() {
-            // Drop audio the sink still holds from the old position.
-            if let Err(e) = self.sink.flush() {
-                error!("{e}");
-            }
             match decoder.seek(position_ms) {
                 Ok(new_position_ms) => {
+                    self.clear_sink();
                     if let PlayerState::Playing {
                         ref mut stream_position_ms,
                         ref track_id,
@@ -2828,16 +2835,17 @@ mod tests {
         }
     }
 
-    /// Records how many seeks the decoder had made each time the sink was flushed.
-    struct FlushProbe {
+    /// Records how many seeks the decoder had made each time the sink was cleared.
+    #[derive(Clone, Default)]
+    struct ClearProbe {
         seeks: Arc<Mutex<Vec<u32>>>,
-        flushed_after: Arc<Mutex<Vec<usize>>>,
+        cleared_after: Arc<Mutex<Vec<usize>>>,
     }
 
-    impl Sink for FlushProbe {
-        fn flush(&mut self) -> SinkResult<()> {
+    impl Sink for ClearProbe {
+        fn clear(&mut self) -> SinkResult<()> {
             let seeks = self.seeks.lock().unwrap().len();
-            self.flushed_after.lock().unwrap().push(seeks);
+            self.cleared_after.lock().unwrap().push(seeks);
             Ok(())
         }
 
@@ -2846,28 +2854,82 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn seeking_flushes_the_sink_before_the_decoder_moves() {
+    /// A playing player whose decoder and sink report to the returned probe.
+    fn probed_player() -> (PlayerInternal, ClearProbe) {
         let (_commands, rx) = mpsc::unbounded_channel();
-        let seeks = Arc::new(Mutex::new(vec![]));
+        let probe = ClearProbe::default();
         let mut player = playing_player(
             rx,
             TestDecoder {
-                seeks: seeks.clone(),
+                seeks: probe.seeks.clone(),
                 packets: Default::default(),
             },
         );
-        let flushed_after = Arc::new(Mutex::new(vec![]));
-        player.sink = Box::new(FlushProbe {
-            seeks: seeks.clone(),
-            flushed_after: flushed_after.clone(),
-        });
+        player.sink = Box::new(probe.clone());
+        (player, probe)
+    }
+
+    #[tokio::test]
+    async fn seeking_clears_the_sink_after_the_decoder_moves() {
+        let (mut player, probe) = probed_player();
         player.handle_command_seek(30_000).unwrap();
-        assert_eq!(*seeks.lock().unwrap(), [30_000]);
+        assert_eq!(*probe.seeks.lock().unwrap(), [30_000]);
         assert_eq!(
-            *flushed_after.lock().unwrap(),
-            [0],
-            "the sink is flushed once, before the decoder seeks"
+            *probe.cleared_after.lock().unwrap(),
+            [1],
+            "the sink is cleared once, after the decoder seeks"
+        );
+    }
+
+    #[tokio::test]
+    async fn loading_the_playing_track_at_another_position_clears_the_sink() {
+        let (mut player, probe) = probed_player();
+        let PlayerState::Playing { ref track_id, .. } = player.state else {
+            unreachable!()
+        };
+        player
+            .handle_command_load(track_id.clone(), None, true, 30_000)
+            .unwrap();
+        assert_eq!(*probe.seeks.lock().unwrap(), [30_000]);
+        assert_eq!(
+            *probe.cleared_after.lock().unwrap(),
+            [1],
+            "the sink is cleared once, after the decoder seeks"
+        );
+    }
+
+    #[tokio::test]
+    async fn seeking_while_paused_leaves_the_stopped_sink_alone() {
+        let (mut player, probe) = probed_player();
+        player.handle_pause();
+        player.handle_command_seek(30_000).unwrap();
+        assert_eq!(*probe.seeks.lock().unwrap(), [30_000]);
+        assert!(
+            probe.cleared_after.lock().unwrap().is_empty(),
+            "a stopped sink is not cleared"
+        );
+    }
+
+    struct UnseekableDecoder;
+
+    impl AudioDecoder for UnseekableDecoder {
+        fn seek(&mut self, _: u32) -> Result<u32, DecoderError> {
+            Err(DecoderError::SymphoniaDecoder("unseekable".into()))
+        }
+
+        fn next_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_seek_leaves_the_sink_alone() {
+        let (mut player, probe) = probed_player();
+        *player.state.decoder().unwrap() = Box::new(UnseekableDecoder);
+        player.handle_command_seek(30_000).unwrap();
+        assert!(
+            probe.cleared_after.lock().unwrap().is_empty(),
+            "the sink keeps its audio when the decoder cannot seek"
         );
     }
 }
