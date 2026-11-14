@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- [connect] When the last track ends with nothing left to play, the queue rewinds to its first track, loaded and paused, as Spotify's own clients do, instead of stopping and unloading so that play did nothing
+- [connect] When the queue runs out (its last track ends, or next is pressed on it), rewind to the first track and load it paused, so `Spirc::play` and `Spirc::play_pause` start it again instead of doing nothing on a stopped player. This changes the player events at that point: the first track is loaded, and fetched unless the player still holds it, so `PlayerEvent`/`--onevent` consumers get `track_changed` and `paused` (after `loading` when it is fetched) where they got `stopped`. Playback still stops when the queue runs out because a track fails to load, or when the context can't be rewound
 - [connect] Picking a track in a list plays that track: an empty `track_uri` (or `track_uid`) sent next to the one that identifies the track is ignored, instead of failing to resolve and playing the first track of the context
 
 ### Added
