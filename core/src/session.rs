@@ -125,8 +125,8 @@ struct SessionInternal {
 /// `Player`.
 ///
 /// When the access-point connection is lost, the session logs in again on a new
-/// one and stays valid. If that fails, or the connection keeps closing right after
-/// it opens, the session is invalidated, and an invalidated [Session] cannot be
+/// one and stays valid. If that fails, or a connection closes within 30 seconds of
+/// opening, the session is invalidated, and an invalidated [Session] cannot be
 /// reused: create a new one.
 #[derive(Clone)]
 pub struct Session(Arc<SessionInternal>);
@@ -691,6 +691,8 @@ async fn run_connection(
     store_credentials: bool,
 ) {
     let mut packets = UnboundedReceiverStream::new(packets);
+    // None once the session is shut down or dropped
+    let valid_session = || session_weak.try_upgrade().filter(|s| !s.is_invalid());
     loop {
         let connected_at = TokioInstant::now();
         let (sink, stream) = transport.split();
@@ -701,12 +703,9 @@ async fn run_connection(
             result = packets.by_ref().map(Ok).forward(sink) => result,
         };
 
-        let (Err(error), Some(session)) = (lost, session_weak.try_upgrade()) else {
+        let (Err(error), Some(session)) = (lost, valid_session()) else {
             return;
         };
-        if session.is_invalid() {
-            return;
-        }
         if connected_at.elapsed() < MIN_LIFETIME_TO_RECONNECT {
             error!("Connection to server closed ({error}) right after connecting");
             session.shutdown();
@@ -723,9 +722,13 @@ async fn run_connection(
         )
         .await
         .unwrap_or_else(|elapsed| Err(Error::deadline_exceeded(elapsed)));
+        // A session shut down or dropped meanwhile must not take over the new
+        // connection, nor cache its credentials over another session's.
+        drop(session);
+        let Some(session) = valid_session() else {
+            return;
+        };
         match reconnect {
-            // shut down while reconnecting
-            Ok(_) if session.is_invalid() => return,
             Ok((reusable_credentials, new_transport)) => {
                 session.logged_in(&reusable_credentials, store_credentials);
                 credentials = reusable_credentials;
@@ -738,21 +741,6 @@ async fn run_connection(
                 return;
             }
         }
-    }
-}
-
-#[cfg(test)]
-impl Session {
-    /// A session whose packets go to the returned receiver instead of to a server.
-    pub(crate) fn with_test_connection() -> (Self, mpsc::UnboundedReceiver<(u8, Vec<u8>)>) {
-        let session = Self::new(SessionConfig::default(), None);
-        let (tx_connection, rx_connection) = mpsc::unbounded_channel();
-        session
-            .0
-            .tx_connection
-            .set(tx_connection)
-            .expect("a new session has no connection");
-        (session, rx_connection)
     }
 }
 
@@ -1032,5 +1020,20 @@ where
         }
 
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+impl Session {
+    /// A session whose packets go to the returned receiver instead of to a server.
+    pub(crate) fn with_test_connection() -> (Self, mpsc::UnboundedReceiver<(u8, Vec<u8>)>) {
+        let session = Self::new(SessionConfig::default(), None);
+        let (tx_connection, rx_connection) = mpsc::unbounded_channel();
+        session
+            .0
+            .tx_connection
+            .set(tx_connection)
+            .expect("a new session has no connection");
+        (session, rx_connection)
     }
 }

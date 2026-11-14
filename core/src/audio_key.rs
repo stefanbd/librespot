@@ -40,6 +40,7 @@ component! {
     AudioKeyManager : AudioKeyManagerInner {
         sequence: SeqGenerator<u32> = SeqGenerator::new(0),
         pending: HashMap<u32, PendingKey> = HashMap::new(),
+        invalid: bool = false,
         // Counts the connections to the server, so a request can tell that it was sent
         // again on a new one.
         connection: u32 = 0,
@@ -94,12 +95,14 @@ impl AudioKeyManager {
 
         let (seq, mut connection) = self.lock(move |inner| {
             let seq = inner.sequence.get();
-            let key = PendingKey {
-                track,
-                file,
-                sender: tx,
-            };
-            inner.pending.insert(seq, key);
+            if !inner.invalid {
+                let key = PendingKey {
+                    track,
+                    file,
+                    sender: tx,
+                };
+                inner.pending.insert(seq, key);
+            }
             (seq, inner.connection)
         });
 
@@ -138,6 +141,8 @@ impl AudioKeyManager {
         let requests: Vec<_> = self.lock(|inner| {
             inner.connection = inner.connection.wrapping_add(1);
             inner.reconnecting = false;
+            // requests whose callers stopped waiting
+            inner.pending.retain(|_, key| !key.sender.is_closed());
             inner
                 .pending
                 .iter()
@@ -152,11 +157,11 @@ impl AudioKeyManager {
     }
 
     /// Ends the pending requests of a session that is shut down, for example after
-    /// it could not reconnect, and lets later ones time out instead of waiting for
-    /// a reconnect that the session no longer makes.
+    /// it could not reconnect, and the ones made later, as Mercury does: none waits
+    /// for a reconnect that the session no longer makes.
     pub(crate) fn shutdown(&self) {
         self.lock(|inner| {
-            inner.reconnecting = false;
+            inner.invalid = true;
             inner.pending.clear();
         });
     }
@@ -190,7 +195,10 @@ mod tests {
     }
 
     async fn sent_request(packets: &mut mpsc::UnboundedReceiver<(u8, Vec<u8>)>) -> Vec<u8> {
-        let (cmd, data) = packets.recv().await.expect("a key request");
+        let (cmd, data) = tokio::time::timeout(Duration::from_secs(60), packets.recv())
+            .await
+            .expect("a key request was sent")
+            .expect("the session is open");
         assert_eq!(cmd, PacketType::RequestKey as u8);
         data
     }
@@ -219,7 +227,12 @@ mod tests {
         let (session, _packets) = Session::with_test_connection();
         let started = Instant::now();
 
-        let result = session.audio_key().request(track(), file()).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            session.audio_key().request(track(), file()),
+        )
+        .await
+        .expect("the request ended");
 
         assert!(is_timeout(&result.expect_err("no reply came")));
         assert_eq!(started.elapsed(), Duration::from_millis(1500));
@@ -249,6 +262,21 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_request_given_up_on_is_not_sent_again() {
+        let (session, mut packets) = Session::with_test_connection();
+        let keys = session.audio_key();
+        let request = spawn_request(keys);
+        sent_request(&mut packets).await;
+        request.abort();
+        let _ = request.await;
+
+        keys.connection_lost();
+        keys.reconnected();
+
+        assert!(packets.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_shutdown_ends_a_request_waiting_for_a_reconnect() {
         let (session, mut packets) = Session::with_test_connection();
         let keys = session.audio_key();
@@ -269,10 +297,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_request_after_a_shutdown_does_not_wait_for_a_reconnect() {
+    async fn a_request_after_a_shutdown_ends_at_once() {
         let (session, _packets) = Session::with_test_connection();
-        session.audio_key().connection_lost();
+        let started = Instant::now();
         session.shutdown();
+        // the connection task can still report a loss that raced the shutdown
+        session.audio_key().connection_lost();
 
         let result = tokio::time::timeout(
             Duration::from_secs(60),
@@ -281,6 +311,7 @@ mod tests {
         .await
         .expect("the request ended");
 
-        assert!(is_timeout(&result.expect_err("no reply came")));
+        assert!(!is_timeout(&result.expect_err("no reply came")));
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 }

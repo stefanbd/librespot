@@ -62,8 +62,7 @@ impl From<APLoginFailed> for AuthenticationError {
     }
 }
 
-/// How long the server may take to accept a connection and finish the handshake,
-/// and to answer the login.
+/// How long the server may take to finish the handshake, and to answer the login.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn connect(host: &str, port: u16, proxy: Option<&Url>) -> io::Result<Transport> {
